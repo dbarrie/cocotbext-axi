@@ -25,6 +25,7 @@ THE SOFTWARE.
 import logging
 
 import cocotb
+import cocotb.triggers
 
 from .version import __version__
 from .constants import AxiBurstType, AxiProt, AxiResp
@@ -204,7 +205,7 @@ class AxiSlaveWrite(Reset):
 
 
 class AxiSlaveRead(Reset):
-    def __init__(self, bus, clock, reset=None, target=None, reset_active_level=True, **kwargs):
+    def __init__(self, bus, clock, reset=None, target=None, reset_active_level=True, interleave_depth=1, **kwargs):
         self.bus = bus
         self.clock = clock
         self.reset = reset
@@ -234,11 +235,17 @@ class AxiSlaveRead(Reset):
 
         self.max_burst_size = (self.byte_lanes-1).bit_length()
 
+        self.interleave_depth = interleave_depth
+        assert self.interleave_depth > 0
+
+        self.int_read_result_queue = [[] for i in range(self.interleave_depth)]
+
         self.log.info("AXI slave model configuration:")
         self.log.info("  Address width: %d bits", self.address_width)
         self.log.info("  ID width: %d bits", self.id_width)
         self.log.info("  Byte size: %d bits", self.byte_size)
         self.log.info("  Data width: %d bits (%d bytes)", self.width, self.byte_lanes)
+        self.log.info("  Interleave depth: %d queues", self.interleave_depth)
 
         self.log.info("AXI slave model signals:")
         for bus in (self.bus.ar, self.bus.r):
@@ -253,6 +260,7 @@ class AxiSlaveRead(Reset):
         assert len(self.r_channel.bus.rid) == len(self.ar_channel.bus.arid)
 
         self._process_read_cr = None
+        self._process_read_result_queue_cr = None
 
         self._init_reset(reset, reset_active_level)
 
@@ -265,6 +273,9 @@ class AxiSlaveRead(Reset):
             if self._process_read_cr is not None:
                 self._process_read_cr.kill()
                 self._process_read_cr = None
+            if self._process_read_result_queue_cr is not None:
+                self._process_read_result_queue_cr.kill()
+                self._process_read_result_queue_cr = None
 
             self.ar_channel.clear()
             self.r_channel.clear()
@@ -272,6 +283,8 @@ class AxiSlaveRead(Reset):
             self.log.info("Reset de-asserted")
             if self._process_read_cr is None:
                 self._process_read_cr = cocotb.start_soon(self._process_read())
+            if self._process_read_result_queue_cr is None:
+                self._process_read_result_queue_cr = cocotb.start_soon(self._process_read_result_queue())
 
     async def _process_read(self):
         while True:
@@ -322,7 +335,10 @@ class AxiSlaveRead(Reset):
 
                 r.rdata = int.from_bytes(data, 'little')
 
-                await self.r_channel.send(r)
+                # To test read-data interleaving, the transaction responses are fed into
+                # a queue based on the arid and the interleave depth
+                queue_idx = arid % self.interleave_depth
+                self.int_read_result_queue[queue_idx].append(r)
 
                 if self.log.isEnabledFor(logging.DEBUG):
                     self.log.debug("Read word awid: 0x%x addr: 0x%08x data: %s",
@@ -335,6 +351,16 @@ class AxiSlaveRead(Reset):
                         if cur_addr == upper_wrap_boundary:
                             cur_addr = lower_wrap_boundary
 
+    async def _process_read_result_queue(self):
+        queue_idx = 0
+        while True:
+            await cocotb.triggers.RisingEdge(self.clock)
+
+            if self.int_read_result_queue[queue_idx]:
+                r = self.int_read_result_queue[queue_idx].pop(0)
+                await self.r_channel.send(r)
+
+            queue_idx = (queue_idx + 1) % self.interleave_depth
 
 class AxiSlave:
     def __init__(self, bus, clock, reset=None, target=None, reset_active_level=True, **kwargs):
